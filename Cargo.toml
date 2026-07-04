@@ -1,0 +1,7 @@
+[package]
+name = "test-tun"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tun-rs = "2.8.5"
