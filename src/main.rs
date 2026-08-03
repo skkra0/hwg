@@ -1,16 +1,16 @@
 use std::{env, net::{IpAddr, Ipv4Addr, SocketAddr}, str::FromStr, sync::Arc};
 
 use anyhow::Result;
-use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce, aead::{Generate}};
-use tokio::net::{UdpSocket};
+use tokio::{net::UdpSocket, sync::Mutex};
 use tun_rs::DeviceBuilder;
 
-use crypto::{NONCE_LEN, TAG_LEN};
+use crate::{handshake::{Session, build_initiator, build_responder}, ipv4::Ipv4Header};
 
-mod crypto;
+mod handshake;
 mod ipv4;
 
-const MAX_IP_LEN: usize = 65535;
+const MTU: u16 = 1420;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let self_addr = match env::var("SELF_ADDR") {
@@ -30,78 +30,114 @@ async fn main() -> Result<()> {
     let dev = DeviceBuilder::new()
         .name("utun7")
         .ipv4(self_addr, 24, None)
-        .mtu(1420)
+        .mtu(MTU)
         .build_async()
         .unwrap();
     let sock = UdpSocket::bind("0.0.0.0:51820").await?;
     
-    let key_bytes: &[u8] = b"\xe5r\xd8\xa5\x13oH\xf8\xa2r`\x17KX\xcc\xca\x0fN\xa5\xd5\xda\xd1\xad\xf5\xd1\xbc1S\xa2a\xc6v";
-    let key: [u8; 32] = key_bytes.try_into().expect("Invalid key length");
-    let cipher = ChaCha20Poly1305::new(&key.into());
-
     let dev = Arc::new(dev);
     let sock = Arc::new(sock);
+    let state = Arc::new(Mutex::new(Session::Idle));
 
     // outbound: TUN → UDP
     let dev_out = dev.clone();
     let sock_out = sock.clone();
-    let cipher_out = cipher.clone();
+    let state_out = state.clone();
+
+
     tokio::spawn(async move {
         // layout: [plaintext/ciphertext | nonce | tag]
-        let mut buf = [0u8; MAX_IP_LEN + NONCE_LEN + TAG_LEN];
+        let mut buf = [0u8; MTU as usize];
+        let mut ct = [0u8; MTU as usize];
         loop {
             // read the IP packet in place
             let n = dev_out.recv(&mut buf).await.unwrap();
-            let ip_header = match ipv4::Ipv4Header::try_from(&buf[..NONCE_LEN+TAG_LEN]) {
-                Ok(h) => h,
-                Err(e) =>{
-                    eprintln!("{}", e);
-                    continue;
-                }
-            };
-            println!("{}", ip_header);
-
-            // fresh random nonce every packet — never reused with this key
-            let nonce = Nonce::generate();
-            match crypto::encrypt(&mut buf[..n+NONCE_LEN+TAG_LEN], &cipher_out, nonce) {
-                Ok(buf) => {
-                    sock_out
-                        .send_to(buf, peer_addr)
-                        .await
-                        .unwrap();
-                    println!("sent");
+            match Ipv4Header::try_from(&buf[..n]) {
+                Ok(h) => {
+                    println!("{}", h);
                 },
                 Err(e) => {
-                    eprintln!("{}", e);
+                    eprintln!("{e}");
                     continue;
                 }
-            };
+            }
+            let mut s = state_out.lock().await;
+            println!("{}", match *s {
+                Session::Idle => "idle",
+                Session::Initiated(_) => "initiated",
+                Session::Up(_) => "up",
+            });
+            match &mut *s {
+                Session::Idle => {
+                    let mut hs = build_initiator().unwrap();
+                    let mut m = [0u8; 513];
+                    m[0] = handshake::MSG_INIT;
+                    let len = hs.write_message(&[], &mut m[1..]).unwrap();
+                    sock_out.send_to(&m[..1 + len], peer_addr).await.unwrap();
+                    *s = Session::Initiated(hs);
+                },
+                Session::Initiated(_) => {},
+                Session::Up(ts) => {
+                    println!("transport: encrypting {n} bytes");
+                    let len = ts.write_message(&buf[..n], &mut ct[1..]).unwrap();
+                    ct[0] = handshake::MSG_TRANSPORT;
+                    sock_out.send_to(&ct[..1 + len], peer_addr).await.unwrap();
+                }
+            }
         }
     });
 
     // inbound: UDP → TUN
-    let cipher_in = cipher;
     tokio::spawn(async move {
-        // layout: [ciphertext | nonce | tag]
-        let mut buf = [0u8; MAX_IP_LEN + crypto::NONCE_LEN + crypto::TAG_LEN];
+        let mut buf = [0u8; MTU as usize];
+        let mut pt = [0u8; MTU as usize];
         loop {
             let (n, _from) = sock.recv_from(&mut buf).await.unwrap();
+            if n == 0 { continue; }
+            let (t, msg) = (buf[0], &buf[1..n]);
+            println!("received type {} message", match t {
+                handshake::MSG_INIT => "init",
+                handshake::MSG_RESP => "resp",
+                handshake::MSG_TRANSPORT => "transport",
+                other => "unknown",
+            });
+            let mut s= state.lock().await;
+            match t {
+                handshake::MSG_INIT => {
+                    let mut hs = build_responder().unwrap();
+                    match hs.read_message(msg, &mut []) {
+                        Err(e) => {
+                            eprintln!("failed to read init message: {e:?}");
+                            continue;
+                        },
+                        default => {}
+                    };
+                    let mut m2 = [0u8; 513];
+                    m2[0] = handshake::MSG_RESP;
+                    let len = hs.write_message(&[], &mut m2[1..]).unwrap();
+                    sock.send_to(&m2[..1+len], peer_addr).await.unwrap();
+                    *s = Session::Up(hs.into_transport_mode().unwrap());
+                },
+                handshake::MSG_RESP => {
+                    if let Session::Initiated(mut hs) =
+                    std::mem::replace(&mut *s, Session::Idle) {
+                        if hs.read_message(msg, &mut []).is_ok() {
+                            *s = Session::Up(hs.into_transport_mode().unwrap());
+                        }
+                    }
+                },
+                handshake::MSG_TRANSPORT => {
+                    if let Session::Up(ts) = &mut *s {
+                        if let Ok(len) = ts.read_message(msg, &mut pt) {
+                            dev.send(&pt[..len]).await.unwrap();
+                            println!("transport: got {len} bytes");
+                        }
+                    }
+                },
+                other => eprintln!("unknown type {other}"),
 
-            // drop anything too short to contain a nonce + tag
-            if n < crypto::NONCE_LEN + crypto::TAG_LEN {
-                continue;
             }
-
-            match crypto::decrypt(&mut buf[..n], &cipher_in) {
-                Ok((msg, _)) => {
-                    dev.send(msg).await.unwrap();
-                    println!("decrypted and sent");
-                }
-                Err(e) => {
-                    eprintln!("invalid payload: {}", e);
-                    continue;
-                }
-            };
+            // handle received from UDP
         }
     })
     .await?;
