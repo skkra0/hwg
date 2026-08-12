@@ -1,16 +1,19 @@
-use std::{collections::HashMap, env, net::{Ipv4Addr, SocketAddrV4}, str::FromStr, sync::Arc};
+use std::{env, net::{Ipv4Addr, SocketAddrV4}, str::FromStr, sync::Arc};
 
 use anyhow::Result;
 use tokio::{net::UdpSocket};
 use tun_rs::DeviceBuilder;
 
-use crate::{handshake::{Session, Destination}};
+use crate::{handshake::{Session, Destination, TRANSPORT_OVERHEAD}};
 
 mod handshake;
 mod ipv4;
 mod conf;
 
+// Largest plaintext accepted by the tun
 const MTU: u16 = 1420;
+// Largest datagram sent or received from the UDP socket
+const MAX_DATAGRAM_LEN: usize = MTU as usize + TRANSPORT_OVERHEAD;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -21,11 +24,6 @@ async fn main() -> Result<()> {
 
     let conf = conf::read_from_file(conf_file.as_str())?;
     let peers = conf.peers;
-    let mut ip_peer_map = HashMap::new();
-    for (_, peer) in &peers {
-        let addr = u32::from(peer.addr);
-        ip_peer_map.insert(addr, peer);
-    }
     let interface = conf.interface;
     println!("addr: {}", interface.addr);
 
@@ -48,11 +46,12 @@ async fn main() -> Result<()> {
     let sock_out = sock.clone();
 
     let session_out = session.clone();
+
     // TUN to UDP: initiator
     tokio::spawn(async move {
-        // layout: [plaintext/ciphertext | nonce | tag]
+        // plaintext in, [type | ciphertext | tag] out
         let mut buf = [0u8; MTU as usize];
-        let mut ct = [0u8; MTU as usize];
+        let mut ct = [0u8; MAX_DATAGRAM_LEN];
         loop {
             // read the IP packet in place
             let n = dev_out.recv(&mut buf).await.unwrap();
@@ -72,7 +71,7 @@ async fn main() -> Result<()> {
 
     // UDP to TUN: responder
     tokio::spawn(async move {
-        let mut buf = [0u8; MTU as usize];
+        let mut buf = [0u8; MAX_DATAGRAM_LEN];
         let mut out= [0u8; MTU as usize];
         loop {
             let (n, src_addr) = sock.recv_from(&mut buf).await.unwrap();

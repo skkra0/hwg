@@ -6,10 +6,32 @@ use tokio::sync::Mutex;
 
 use crate::{conf::Peer, ipv4::Ipv4Header};
 
+#[derive(Default)]
 pub enum SessionState {
+    #[default]
     Idle,
     Initiated{ hs: HandshakeState, peer: SocketAddr },
     Up{ ts: TransportState, peer: SocketAddr },
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+
+/// Which variant a [`SessionState`] currently holds. Used for testing
+/// because HandshakeState, TransportState are not comparable.
+pub enum StateKind {
+    Idle,
+    Initiated,
+    Up,
+}
+
+impl SessionState {
+    fn kind(&self) -> StateKind {
+        match self {
+            SessionState::Idle => StateKind::Idle,
+            SessionState::Initiated { .. } => StateKind::Initiated,
+            SessionState::Up { .. } => StateKind::Up,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -20,7 +42,7 @@ pub struct Session {
     pub ip_to_key: HashMap<u32, [u8;32]>,
 }
 
-#[derive(PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum Destination {
     Socket,
     Tun,
@@ -30,6 +52,12 @@ pub enum Destination {
 pub const MSG_INIT: u8 = 254;
 pub const MSG_RESP: u8 = 253;
 pub const MSG_TRANSPORT: u8 = 252;
+
+pub const TYPE_LEN: usize = 1;
+pub const TAG_LEN: usize = 16;
+
+/// Output buffer passed to [`Session::handle_outbound_msg`] must be at least this much larger than the MTU.
+pub const TRANSPORT_OVERHEAD: usize = TYPE_LEN + TAG_LEN;
 
 fn params() -> NoiseParams {
     "Noise_IK_25519_ChaChaPoly_BLAKE2s".parse().unwrap()
@@ -71,45 +99,65 @@ impl Session {
         self.peers.get(key)
     }
 
+    /// Returns the current state. Used for tests.
+    pub async fn state_kind(&self) -> StateKind {
+        self.state.lock().await.kind()
+    }
+
     pub async fn handle_outbound_msg<'a> (&self, buf: &[u8], out: &'a mut [u8]) -> Result<(&'a [u8], Option<SocketAddr>)> {
-        let dst_addr = match Ipv4Header::try_from(buf) {
-            Ok(h) => {
-                println!("{h}");
-                h.dst_addr
-            },
-            Err(e) => {
-                return Err(anyhow!(e))
-            }
-        };
-       let mut s = self.state.lock().await; 
+        let dst_addr = Ipv4Header::try_from(buf).map_err(|e| anyhow!(e))?.dst_addr;
+
+        if out.is_empty() {
+            return Err(anyhow!("output buffer is empty"));
+        }
+
+       let mut s = self.state.lock().await;
        match &mut *s {
         SessionState::Idle => {
             let peer = self.peer_by_ip(dst_addr).ok_or_else(|| anyhow!("unreachable dst: not a peer"))?;
             let endpoint = peer.endpoint.ok_or_else(|| anyhow!("unreachable dst: endpoint unknown"))?;
 
             let remote_pubkey = peer.pub_key;
-            let mut hs = build_initiator(&self.priv_key, &remote_pubkey[..]).unwrap();
+            let mut hs = build_initiator(&self.priv_key, &remote_pubkey[..])?;
             out[0] = MSG_INIT;
-            let len = hs.write_message(&[], &mut out[1..]).unwrap();
+            let len = hs.write_message(&[], &mut out[TYPE_LEN..])?;
+            println!("{len}");
             *s = SessionState::Initiated { hs: hs, peer: endpoint };
-            return Ok((&out[..len + 1], Some(endpoint)))
+            return Ok((&out[..len + TYPE_LEN], Some(endpoint)))
         },
         SessionState::Initiated { hs: _, peer: _ } => {
             return Ok((&out[0..0], None))
         },
         SessionState::Up{ ts, peer } => {
-            let len = ts.write_message(buf, &mut out[1..]).unwrap();
+            if out.len() < buf.len() + TRANSPORT_OVERHEAD {
+                return Err(anyhow!(
+                    "output buffer too small: {} bytes for a {} byte packet, need {}",
+                    out.len(),
+                    buf.len(),
+                    buf.len() + TRANSPORT_OVERHEAD,
+                ));
+            }
+            let len = ts.write_message(buf, &mut out[TYPE_LEN..])?;
             out[0] = MSG_TRANSPORT;
-            return Ok((&out[..len + 1], Some(peer.to_owned())))
+            return Ok((&out[..len + TYPE_LEN], Some(peer.to_owned())))
         }
        }
     }
 
     pub async fn handle_inbound_msg<'a> (&self, buf: &[u8], out: &'a mut [u8], src_addr: SocketAddr) -> Result<(&'a [u8], Destination)> {
-        let (t, msg) = (buf[0], &buf[1..]);
+        let Some((&t, msg)) = buf.split_first() else {
+            return Err(anyhow!("empty datagram"));
+        };
         let mut s = self.state.lock().await;
         match t {
             MSG_INIT => {
+                if let SessionState::Up { ts: _, peer: _ } = *s {
+                    return Ok((&[], Destination::Null));
+                }
+
+                if out.is_empty() {
+                    return Err(anyhow!("output buffer is empty"));
+                }
                 let mut hs = build_responder(&self.priv_key[..])?;
                 match hs.read_message(msg, &mut []) {
                     Err(e) => {
@@ -123,16 +171,23 @@ impl Session {
                 };
 
                 out[0] = MSG_RESP;
-                let len = hs.write_message(&[], &mut out[1..])?;
+                let len = hs.write_message(&[], &mut out[TYPE_LEN..])?;
                 *s = SessionState::Up { ts: hs.into_transport_mode()?, peer: src_addr };
-                return Ok((&out[..len + 1], Destination::Socket));
+                return Ok((&out[..len + TYPE_LEN], Destination::Socket));
             },
             MSG_RESP => {
-                if let SessionState::Initiated{ mut hs, peer } =
-                    std::mem::replace(&mut *s, SessionState::Idle) {
-                        hs.read_message(msg, &mut [])?;
-                        *s = SessionState::Up{ ts: hs.into_transport_mode().unwrap(), peer };
-                }
+                let SessionState::Initiated { hs, .. } = &mut *s else {
+                    return Ok((&[], Destination::Null));
+                };
+                hs.read_message(msg, &mut [])?;
+
+                // take is needed to gain ownership over hs: swaps the value to default Idle
+                let SessionState::Initiated { hs, peer } =
+                    std::mem::take(&mut *s)
+                else {
+                    unreachable!("state matched above and the lock is held throughout")
+                };
+                *s = SessionState::Up { ts: hs.into_transport_mode()?, peer };
                 return Ok((&[], Destination::Null));
             },
             MSG_TRANSPORT => {
