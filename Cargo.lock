@@ -544,6 +544,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "hwg"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "chacha20poly1305 0.11.0",
+ "snow",
+ "tokio",
+ "tun-rs",
+]
+
+[[package]]
 name = "hybrid-array"
 version = "0.4.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1019,18 +1031,6 @@ checksum = "8e1d1b10ced5ca923a1fcb8d03e96b8d3268065d724548c0211415ff6ac6bac4"
 dependencies = [
  "core-foundation-sys",
  "libc",
-]
-
-[[package]]
-name = "test-tun"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64",
- "chacha20poly1305 0.11.0",
- "snow",
- "tokio",
- "tun-rs",
 ]
 
 [[package]]
