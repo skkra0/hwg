@@ -55,7 +55,7 @@ async fn main() -> Result<()> {
         loop {
             // read the IP packet in place
             let n = dev_out.recv(&mut buf).await.unwrap();
-            match session_out.handle_outbound_msg(&buf[..n], &mut ct).await {
+            match session_out.handle_outbound_msg(&buf[..n], &mut ct) {
                 Ok((out, addr)) => {
                     if out.len() > 0 && let Some(addr) = addr {
                         sock_out.send_to(out, addr).await.unwrap();
@@ -77,7 +77,7 @@ async fn main() -> Result<()> {
             let (n, src_addr) = sock.recv_from(&mut buf).await.unwrap();
             if n == 0 { continue; }
 
-            match session.handle_inbound_msg(&buf[..n], &mut out, src_addr).await {
+            match session.handle_inbound_msg(&buf[..n], &mut out, src_addr) {
                 Ok((out, dst)) => {
                     if out.len() == 0 {
                         continue;

@@ -1,8 +1,7 @@
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::{collections::HashMap, net::SocketAddr, sync::{Arc, Mutex}};
 
 use anyhow::{anyhow, Result};
 use snow::{Builder, HandshakeState, params::NoiseParams, TransportState};
-use tokio::sync::Mutex;
 
 use crate::{conf::Peer, ipv4::Ipv4Header};
 
@@ -16,8 +15,8 @@ pub enum SessionState {
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 
-/// Which variant a [`SessionState`] currently holds. Used for testing
-/// because HandshakeState, TransportState are not comparable.
+/// Which variant a [`SessionState`] currently holds
+/// Used for testing because [`HandshakeState`], [`TransportState`] are not comparable
 pub enum StateKind {
     Idle,
     Initiated,
@@ -56,7 +55,7 @@ pub const MSG_TRANSPORT: u8 = 252;
 pub const TYPE_LEN: usize = 1;
 pub const TAG_LEN: usize = 16;
 
-/// Output buffer passed to [`Session::handle_outbound_msg`] must be at least this much larger than the MTU.
+/// Output buffer passed to [`Session::handle_outbound_msg`] must be at least this much larger than the MTU
 pub const TRANSPORT_OVERHEAD: usize = TYPE_LEN + TAG_LEN;
 
 fn params() -> NoiseParams {
@@ -100,18 +99,18 @@ impl Session {
     }
 
     /// Returns the current state. Used for tests.
-    pub async fn state_kind(&self) -> StateKind {
-        self.state.lock().await.kind()
+    pub fn state_kind(&self) -> Result<StateKind> {
+        Ok(self.state.lock().map_err(|e| anyhow!("cannot obtain lock: {e}"))?.kind())
     }
 
-    pub async fn handle_outbound_msg<'a> (&self, buf: &[u8], out: &'a mut [u8]) -> Result<(&'a [u8], Option<SocketAddr>)> {
+    pub fn handle_outbound_msg<'a> (&self, buf: &[u8], out: &'a mut [u8]) -> Result<(&'a [u8], Option<SocketAddr>)> {
         let dst_addr = Ipv4Header::try_from(buf).map_err(|e| anyhow!(e))?.dst_addr;
 
         if out.is_empty() {
             return Err(anyhow!("output buffer is empty"));
         }
 
-       let mut s = self.state.lock().await;
+       let mut s = self.state.lock().map_err(|e| anyhow!("cannot obtain lock"))?;
        match &mut *s {
         SessionState::Idle => {
             let peer = self.peer_by_ip(dst_addr).ok_or_else(|| anyhow!("unreachable dst: not a peer"))?;
@@ -121,7 +120,6 @@ impl Session {
             let mut hs = build_initiator(&self.priv_key, &remote_pubkey[..])?;
             out[0] = MSG_INIT;
             let len = hs.write_message(&[], &mut out[TYPE_LEN..])?;
-            println!("{len}");
             *s = SessionState::Initiated { hs: hs, peer: endpoint };
             return Ok((&out[..len + TYPE_LEN], Some(endpoint)))
         },
@@ -144,11 +142,11 @@ impl Session {
        }
     }
 
-    pub async fn handle_inbound_msg<'a> (&self, buf: &[u8], out: &'a mut [u8], src_addr: SocketAddr) -> Result<(&'a [u8], Destination)> {
+    pub fn handle_inbound_msg<'a> (&self, buf: &[u8], out: &'a mut [u8], src_addr: SocketAddr) -> Result<(&'a [u8], Destination)> {
         let Some((&t, msg)) = buf.split_first() else {
             return Err(anyhow!("empty datagram"));
         };
-        let mut s = self.state.lock().await;
+        let mut s = self.state.lock().map_err(|e| anyhow!("cannot obtain lock: {e}"))?;
         match t {
             MSG_INIT => {
                 if let SessionState::Up { ts: _, peer: _ } = *s {
@@ -199,5 +197,90 @@ impl Session {
             },
             _ => Err(anyhow!("unknown message type")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{net::Ipv4Addr, str::FromStr};
+
+use super::*;
+
+    fn init_session_with_peer(addr: Ipv4Addr, endpoint: Option<SocketAddr>) -> Session {
+        let mut peers = HashMap::new();
+        peers.insert([1; 32], Peer {
+            pub_key: [1; 32],
+            addr,
+            endpoint,
+        });
+        Session::new([0; 32], peers)
+    }
+
+    fn write_valid_ip_packet(out: &mut [u8], dst_addr: Ipv4Addr) {
+        let header = Ipv4Header::new(
+            6,
+            64, 
+            u32::from(Ipv4Addr::new(127, 0, 0, 1)),
+            u32::from(dst_addr),
+            0
+        );
+
+        header.write_to(out).unwrap();
+    }
+
+    #[test]
+    pub fn idle_first_packet_emits_init() {
+        let from_addr = Ipv4Addr::new(10, 0, 0, 2);
+        let to_addr = Ipv4Addr::new(10, 0, 0, 1);
+        let to_endpoint = SocketAddr::from_str("172.16.0.1:51820").unwrap();
+        
+        let session = init_session_with_peer(to_addr, Some(to_endpoint));
+        assert!(session.state_kind().unwrap().eq(&StateKind::Idle));
+
+        let header = Ipv4Header::new(
+            6,
+            64, 
+            u32::from(from_addr),
+            u32::from(to_addr),
+            0
+        );
+        let mut first_packet = [0u8; 1420];
+        write_valid_ip_packet(&mut first_packet, to_addr);
+
+        let mut out = [0u8; 1437];
+        let (out, addr) = session.handle_outbound_msg(&first_packet, &mut out).unwrap();
+        let addr = addr.unwrap();
+        assert!(addr.eq(&to_endpoint));
+        assert!(out[0] == MSG_INIT);
+        assert!(session.state_kind().unwrap().eq(&StateKind::Initiated));
+    }
+
+    #[test]
+    pub fn outbound_rejects_non_ip_packet() {
+        let packet = [0u8; 1420];
+        let mut out = [0u8; 1437];
+        let session = init_session_with_peer(Ipv4Addr::new(10, 0, 0, 1), Some(SocketAddr::from_str("172.16.0.1:51820").unwrap()));
+        let err = session.handle_outbound_msg(&packet, &mut out).unwrap_err();
+        assert!(err.to_string().contains("ipv4:"));
+    }
+
+    #[test]
+    pub fn outbound_unknown_destination_errors() {
+        let session = init_session_with_peer(Ipv4Addr::new(10, 0, 0, 1), None);
+        let mut packet = [0u8; 1420];
+        write_valid_ip_packet(&mut packet, Ipv4Addr::new(10, 0, 0, 2));
+        let mut out = [0u8; 1437];
+        let err = session.handle_outbound_msg(&packet, &mut out).unwrap_err();
+        assert!(err.to_string().contains("unreachable"));
+    }
+    #[test]
+    pub fn outbound_peer_without_endpoint_errors() {
+        let dst = Ipv4Addr::new(10, 0, 0, 1);
+        let session = init_session_with_peer(dst, None);
+        let mut packet = [0u8; 1420];
+        write_valid_ip_packet(&mut packet, dst);
+        let mut out = [0u8; 1437];
+        let err = session.handle_outbound_msg(&packet, &mut out).unwrap_err();
+        assert!(err.to_string().contains("unreachable"));
     }
 }

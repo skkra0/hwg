@@ -121,22 +121,22 @@ impl Display for Ipv4ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Ipv4ParseError::BufferTooShort => {
-                write!(f, "buffer too short: must be at least 20 bytes")?;
+                write!(f, "ipv4: buffer too short: must be at least 20 bytes")?;
             },
             Ipv4ParseError::InvalidVersion(version) => {
-                write!(f, "invalid version {}: expected 4", version)?;
+                write!(f, "ipv4: invalid version {}: expected 4", version)?;
             },
             Ipv4ParseError::InvalidIhl(ihl) => {
-                write!(f, "invalid ihl {}: should be at least 5", ihl)?;
+                write!(f, "ipv4: invalid ihl {}: should be at least 5", ihl)?;
             },
             Ipv4ParseError::InvalidLength(len) => {
-                write!(f, "invalid length {}", len)?;
+                write!(f, "ipv4: invalid length {}", len)?;
             },
             Ipv4ParseError::InvalidFlags(flags) => {
-                write!(f, "invalid flags {:#04x}", flags)?;
+                write!(f, "ipv4: invalid flags {:#04x}", flags)?;
             },
             Ipv4ParseError::InvalidChecksum => {
-                write!(f, "invalid checksum")?;
+                write!(f, "ipv4: invalid checksum")?;
             }
         }
 
