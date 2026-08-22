@@ -1,6 +1,8 @@
-use std::{collections::HashMap, fs::File, io::{self, BufRead}, net::{Ipv4Addr, SocketAddr, SocketAddrV4}, str::FromStr};
+use std::{fmt::Debug, collections::HashMap, fs::File, io::{self, BufRead}, net::{Ipv4Addr, SocketAddr, SocketAddrV4}, str::FromStr};
 use anyhow::{Result, anyhow};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use ip_network::Ipv4Network;
+use ip_network_table::IpNetworkTable;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Interface {
@@ -9,16 +11,23 @@ pub struct Interface {
     pub priv_key: [u8; 32],
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Peer {
     pub pub_key: [u8;32],
-    pub addr: Ipv4Addr,
+    pub allowed_ips: Vec<Ipv4Network>,
     pub endpoint: Option<SocketAddr>,
 }
-#[derive(Debug, Clone)]
+
 pub struct Config {
     pub interface: Interface,
     pub peers: HashMap<[u8;32], Peer>,
+    pub network_table: IpNetworkTable<[u8; 32]>,
+}
+
+impl Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config").field("interface", &self.interface).field("peers", &self.peers).finish()
+    }
 }
 
 fn split_key_value(line: &str) -> Result<(&str, &str)> {
@@ -63,34 +72,34 @@ fn parse_interface(bufreader: &mut impl BufRead, buf: &mut String) -> Result<(In
         match key {
             "Address" => {
                 if addr.is_some() {
-                    return Err(anyhow!("interface: duplicate interface address"))
+                    return Err(anyhow!("parse error (interface): duplicate interface address"))
                 }
                 addr = Some(Ipv4Addr::from_str(value)?);
             },
             "ListenPort" => {
                 if listen_port.is_some() {
-                    return Err(anyhow!("interface: duplicate listen port"));
+                    return Err(anyhow!("parse error (interface): duplicate listen port"));
                 }
                 listen_port = Some(u16::from_str(value)?);
             },
             "PrivateKey" => {
                 if priv_key.is_some() {
-                    return Err(anyhow!("interface: duplicate private key"));
+                    return Err(anyhow!("parse error (interface): duplicate private key"));
                 }
                 priv_key = Some(parse_key(value)?);
             },
             _ => {
-                eprintln!("interface: ignoring unknown field {key}");
+                eprintln!("parse error (interface): ignoring unknown field {key}");
             }
         };
     };
 
-    let addr = addr.ok_or(anyhow!("interface: missing interface address"))?;
+    let addr = addr.ok_or(anyhow!("parse error (interface): missing interface address"))?;
     let listen_port = match listen_port {
         Some(l) => l,
         None => 0,
     };
-    let priv_key = priv_key.ok_or(anyhow!("interface: missing private key"))?;
+    let priv_key = priv_key.ok_or(anyhow!("parse error (interface): missing private key"))?;
 
     Ok((Interface {
         addr,
@@ -101,7 +110,7 @@ fn parse_interface(bufreader: &mut impl BufRead, buf: &mut String) -> Result<(In
 
 fn parse_peer(bufreader: &mut impl BufRead, buf: &mut String) -> Result<(Peer, bool)> {
     let mut pub_key: Option<[u8;32]> = None;
-    let mut allowed_ip: Option<Ipv4Addr> = None;
+    let mut allowed_ips: Option<Vec<Ipv4Network>> = None;
     let mut endpoint: Option<SocketAddr> = None;
     let mut reparse_line = false;
     loop {
@@ -126,20 +135,27 @@ fn parse_peer(bufreader: &mut impl BufRead, buf: &mut String) -> Result<(Peer, b
         match key {
             "PublicKey" => {
                 if pub_key.is_some() {
-                    return Err(anyhow!("peer: duplicate public key"));
+                    return Err(anyhow!("parse error (peer): duplicate public key"));
                 }
                 pub_key = Some(parse_key(value)?);
             },
             "AllowedIPs" => {
-                if allowed_ip.is_some() {
-                    return Err(anyhow!("peer: duplicate allowed ips"));
+                if allowed_ips.is_some() {
+                    return Err(anyhow!("parse error (peer): duplicate allowed ips"));
                 }
 
-                allowed_ip = Some(Ipv4Addr::from_str(value)?);
+                let mut ip_list = Vec::new();
+                
+                for val in value.split(",") {
+                    let ipv4net = Ipv4Network::from_str(val.trim())?;
+                    ip_list.push(ipv4net);
+                }
+
+                allowed_ips = Some(ip_list);
             },
             "Endpoint" => {
                 if endpoint.is_some() {
-                    return Err(anyhow!("peer: duplicate endpoint"));
+                    return Err(anyhow!("parse error (peer): duplicate endpoint"));
                 }
                 endpoint = Some(SocketAddrV4::from_str(value)?.into());
             }
@@ -149,12 +165,12 @@ fn parse_peer(bufreader: &mut impl BufRead, buf: &mut String) -> Result<(Peer, b
         }
     };
 
-    let pub_key = pub_key.ok_or(anyhow!("missing public key"))?;
-    let allowed_ip = allowed_ip.ok_or(anyhow!("missing allowed ips"))?;
+    let pub_key = pub_key.ok_or(anyhow!("parse error (peer): missing public key"))?;
+    let allowed_ips = allowed_ips.ok_or(anyhow!("parse error (peer): missing allowed ips"))?;
 
     Ok((Peer {
         pub_key,
-        addr: allowed_ip,
+        allowed_ips,
         endpoint,
     }, reparse_line))
 }
@@ -164,6 +180,8 @@ fn read_from_reader(mut bufreader: impl BufRead) -> Result<Config> {
     let mut peers = HashMap::new();
     let mut buf = String::new();
     let mut reparse_line = false;
+
+    let mut network_table = IpNetworkTable::new();
     loop {
         let block: &str;
         if reparse_line {
@@ -180,30 +198,33 @@ fn read_from_reader(mut bufreader: impl BufRead) -> Result<Config> {
             if block.is_empty() || block.starts_with("#") {
                 continue;
         }
-
         match block {
             "[Interface]" => {
                 if interface.is_some() {
-                    return Err(anyhow!("duplicate [Interface] block"));
+                    return Err(anyhow!("parse error: duplicate [Interface] block"));
                 }
-                let (intf, reparse) = parse_interface(&mut bufreader, &mut buf)?;
+                let (intf, reparse) = parse_interface(&mut bufreader, &mut buf).map_err(|e| anyhow!("parse error (interface): {e}"))?;
                 interface = Some(intf);
                 reparse_line = reparse;
             },
             "[Peer]" => {
-                let (peer, reparse) = parse_peer(&mut bufreader, &mut buf)?;
+                let (peer, reparse) = parse_peer(&mut bufreader, &mut buf).map_err(|e| anyhow!("parse error (peer): {e}"))?;
+                for ip in &peer.allowed_ips {
+                    network_table.insert(*ip, peer.pub_key.clone());
+                }
                 peers.insert(peer.pub_key, peer);
                 reparse_line = reparse;
             },
             block => {
-                return Err(anyhow!("unexpected text {block}"));
+                return Err(anyhow!("parse error: unexpected text {block}"));
             }
         };
     };
-    let interface = interface.ok_or_else(|| anyhow!("missing [Interface] block"))?;
+    let interface = interface.ok_or_else(|| anyhow!("parse error: missing [Interface] block"))?;
     Ok(Config {
         interface,
         peers,
+        network_table,
     })
 }
 
@@ -260,23 +281,23 @@ UnknownField2 = UnknownValue2
     fn parses_peers() {
         let cfg = parse("[Peer]
 PublicKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
-AllowedIPs = 10.10.1.3
+AllowedIPs = 10.192.124.0/24
 [Interface]
 Address = 10.0.0.1
 ListenPort = 51820
 PrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
 [Peer]
 PublicKey = ABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
-AllowedIPs = 10.10.1.4
+AllowedIPs = 192.168.0.0/16
 Endpoint = 172.16.0.1:51820
 ").unwrap();
         let key1 = parse_key("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=").unwrap();
         let key2 = parse_key("ABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=").unwrap();
-        let peer1 = cfg.peers[&key1];
-        let peer2 = cfg.peers[&key2];
-        assert!(peer1.addr.eq(&Ipv4Addr::new(10,10,1,3)));
+        let peer1 = &cfg.peers[&key1];
+        let peer2 = &cfg.peers[&key2];
+        assert!(peer1.allowed_ips.contains(&Ipv4Network::from_str("10.192.124.0/24").unwrap()));
         assert!(peer1.endpoint.is_none());
-        assert!(peer2.addr.eq(&Ipv4Addr::new(10,10,1,4)));
+        assert!(peer2.allowed_ips.contains(&Ipv4Network::from_str("192.168.0.0/16").unwrap()));
         assert!(peer2.endpoint.unwrap().eq(&SocketAddrV4::from_str("172.16.0.1:51820").unwrap().into()))
     }
 }

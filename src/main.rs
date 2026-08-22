@@ -27,7 +27,7 @@ async fn main() -> Result<()> {
     let interface = conf.interface;
     println!("addr: {}", interface.addr);
 
-    let session = Session::new(interface.priv_key, peers);
+    let session = Arc::new(Session::new(interface.priv_key, peers, conf.network_table));
 
     let dev = DeviceBuilder::new()
         .name("utun7")
@@ -38,7 +38,7 @@ async fn main() -> Result<()> {
     let listen_port = interface.listen_port;
     let listen_addr = SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), listen_port);
     let sock = UdpSocket::bind(listen_addr).await?;
-    
+
     let dev = Arc::new(dev);
     let sock = Arc::new(sock);
 
@@ -48,7 +48,7 @@ async fn main() -> Result<()> {
     let session_out = session.clone();
 
     // TUN to UDP: initiator
-    tokio::spawn(async move {
+    let out_handle = tokio::spawn(async move {
         // plaintext in, [type | ciphertext | tag] out
         let mut buf = [0u8; MTU as usize];
         let mut ct = [0u8; MAX_DATAGRAM_LEN];
@@ -70,7 +70,7 @@ async fn main() -> Result<()> {
     });
 
     // UDP to TUN: responder
-    tokio::spawn(async move {
+    let in_handle = tokio::spawn(async move {
         let mut buf = [0u8; MAX_DATAGRAM_LEN];
         let mut out= [0u8; MTU as usize];
         loop {
@@ -96,9 +96,9 @@ async fn main() -> Result<()> {
                 Err(e) => eprintln!("{e}"),
             }
         }
-    })
-    .await?;
+    });
 
+    tokio::try_join!(out_handle, in_handle)?;
   Ok(())
 }
 
