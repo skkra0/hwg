@@ -27,7 +27,7 @@ async fn main() -> Result<()> {
     let interface = conf.interface;
     println!("addr: {}", interface.addr);
 
-    let session = Arc::new(Session::new(interface.priv_key, peers, conf.network_table));
+    let session = Arc::new(Session::new(interface.priv_key, peers));
 
     let dev = DeviceBuilder::new()
         .name("utun7")
@@ -55,10 +55,10 @@ async fn main() -> Result<()> {
         loop {
             // read the IP packet in place
             let n = dev_out.recv(&mut buf).await.unwrap();
-            match session_out.handle_outbound_msg(&buf[..n], &mut ct) {
-                Ok((out, addr)) => {
-                    if out.len() > 0 && let Some(addr) = addr {
-                        sock_out.send_to(out, addr).await.unwrap();
+            match session_out.write_outbound_msg(&buf[..n], &mut ct) {
+                Ok((len, addr)) => {
+                    if len > 0 && let Some(addr) = addr {
+                        sock_out.send_to(&ct[..len], addr).await.unwrap();
                     }
                 }
                 Err(e) => {
@@ -77,18 +77,18 @@ async fn main() -> Result<()> {
             let (n, src_addr) = sock.recv_from(&mut buf).await.unwrap();
             if n == 0 { continue; }
 
-            match session.handle_inbound_msg(&buf[..n], &mut out, src_addr) {
-                Ok((out, dst)) => {
-                    if out.len() == 0 {
+            match session.write_inbound_msg(&buf[..n], &mut out, src_addr) {
+                Ok((len, dst)) => {
+                    if len == 0 {
                         continue;
                     }
 
                     match dst {
                         Destination::Socket => {
-                            sock.send_to(out, src_addr).await.unwrap();
+                            sock.send_to(&out[..len], src_addr).await.unwrap();
                         },
                         Destination::Tun => {
-                            dev.send(out).await.unwrap();
+                            dev.send(&out[..len]).await.unwrap();
                         },
                         Destination::Null => {},
                     };

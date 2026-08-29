@@ -1,27 +1,25 @@
-use std::{fmt::Debug, collections::HashMap, fs::File, io::{self, BufRead}, net::{Ipv4Addr, SocketAddr, SocketAddrV4}, str::FromStr};
+use std::{fmt::Debug, fs::File, io::{self, BufRead}, net::{Ipv4Addr, SocketAddr, SocketAddrV4}, str::FromStr};
 use anyhow::{Result, anyhow};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use ip_network::Ipv4Network;
-use ip_network_table::IpNetworkTable;
 
 #[derive(Debug, Clone, Copy)]
-pub struct Interface {
+pub struct InterfaceConfig {
     pub addr: Ipv4Addr,
     pub listen_port: u16,
     pub priv_key: [u8; 32],
 }
 
 #[derive(Debug, Clone)]
-pub struct Peer {
+pub struct PeerConfig {
     pub pub_key: [u8;32],
     pub allowed_ips: Vec<Ipv4Network>,
     pub endpoint: Option<SocketAddr>,
 }
 
 pub struct Config {
-    pub interface: Interface,
-    pub peers: HashMap<[u8;32], Peer>,
-    pub network_table: IpNetworkTable<[u8; 32]>,
+    pub interface: InterfaceConfig,
+    pub peers: Vec<PeerConfig>, 
 }
 
 impl Debug for Config {
@@ -44,7 +42,7 @@ fn parse_key(value: &str) -> Result<[u8;32]> {
     Ok(key)
 }
 
-fn parse_interface(bufreader: &mut impl BufRead, buf: &mut String) -> Result<(Interface, bool)> {
+fn parse_interface(bufreader: &mut impl BufRead, buf: &mut String) -> Result<(InterfaceConfig, bool)> {
     let mut addr: Option<Ipv4Addr> = None;
     let mut listen_port: Option<u16> = None;
     let mut priv_key: Option<[u8; 32]> = None;
@@ -101,14 +99,14 @@ fn parse_interface(bufreader: &mut impl BufRead, buf: &mut String) -> Result<(In
     };
     let priv_key = priv_key.ok_or(anyhow!("parse error (interface): missing private key"))?;
 
-    Ok((Interface {
+    Ok((InterfaceConfig {
         addr,
         listen_port,
         priv_key,
     }, reparse_line))
 }
 
-fn parse_peer(bufreader: &mut impl BufRead, buf: &mut String) -> Result<(Peer, bool)> {
+fn parse_peer(bufreader: &mut impl BufRead, buf: &mut String) -> Result<(PeerConfig, bool)> {
     let mut pub_key: Option<[u8;32]> = None;
     let mut allowed_ips: Option<Vec<Ipv4Network>> = None;
     let mut endpoint: Option<SocketAddr> = None;
@@ -168,7 +166,7 @@ fn parse_peer(bufreader: &mut impl BufRead, buf: &mut String) -> Result<(Peer, b
     let pub_key = pub_key.ok_or(anyhow!("parse error (peer): missing public key"))?;
     let allowed_ips = allowed_ips.ok_or(anyhow!("parse error (peer): missing allowed ips"))?;
 
-    Ok((Peer {
+    Ok((PeerConfig {
         pub_key,
         allowed_ips,
         endpoint,
@@ -176,12 +174,11 @@ fn parse_peer(bufreader: &mut impl BufRead, buf: &mut String) -> Result<(Peer, b
 }
 
 fn read_from_reader(mut bufreader: impl BufRead) -> Result<Config> {
-    let mut interface: Option<Interface> = None;
-    let mut peers = HashMap::new();
+    let mut interface: Option<InterfaceConfig> = None;
+    let mut peers = Vec::new();
     let mut buf = String::new();
     let mut reparse_line = false;
 
-    let mut network_table = IpNetworkTable::new();
     loop {
         let block: &str;
         if reparse_line {
@@ -209,10 +206,7 @@ fn read_from_reader(mut bufreader: impl BufRead) -> Result<Config> {
             },
             "[Peer]" => {
                 let (peer, reparse) = parse_peer(&mut bufreader, &mut buf).map_err(|e| anyhow!("parse error (peer): {e}"))?;
-                for ip in &peer.allowed_ips {
-                    network_table.insert(*ip, peer.pub_key.clone());
-                }
-                peers.insert(peer.pub_key, peer);
+                peers.push(peer);
                 reparse_line = reparse;
             },
             block => {
@@ -224,7 +218,6 @@ fn read_from_reader(mut bufreader: impl BufRead) -> Result<Config> {
     Ok(Config {
         interface,
         peers,
-        network_table,
     })
 }
 
@@ -250,6 +243,7 @@ mod tests {
     #[test]
     fn skips_blank_and_comment() {
         let cfg = parse("
+
 # comment
 [Interface]
 Address = 10.0.0.1
@@ -286,6 +280,7 @@ AllowedIPs = 10.192.124.0/24
 Address = 10.0.0.1
 ListenPort = 51820
 PrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+
 [Peer]
 PublicKey = ABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
 AllowedIPs = 192.168.0.0/16
@@ -293,11 +288,13 @@ Endpoint = 172.16.0.1:51820
 ").unwrap();
         let key1 = parse_key("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=").unwrap();
         let key2 = parse_key("ABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=").unwrap();
-        let peer1 = &cfg.peers[&key1];
-        let peer2 = &cfg.peers[&key2];
+        let peer1 = &cfg.peers[0];
+        let peer2 = &cfg.peers[1];
         assert!(peer1.allowed_ips.contains(&Ipv4Network::from_str("10.192.124.0/24").unwrap()));
         assert!(peer1.endpoint.is_none());
+        assert!(peer1.pub_key.eq(&key1));
         assert!(peer2.allowed_ips.contains(&Ipv4Network::from_str("192.168.0.0/16").unwrap()));
-        assert!(peer2.endpoint.unwrap().eq(&SocketAddrV4::from_str("172.16.0.1:51820").unwrap().into()))
+        assert!(peer2.endpoint.unwrap().eq(&SocketAddrV4::from_str("172.16.0.1:51820").unwrap().into()));
+        assert!(peer2.pub_key.eq(&key2));
     }
 }
