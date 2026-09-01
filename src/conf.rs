@@ -1,11 +1,12 @@
-use std::{fmt::Debug, fs::File, io::{self, BufRead}, net::{Ipv4Addr, SocketAddr, SocketAddrV4}, str::FromStr};
+use std::{fmt::Debug, fs::File, io::{self, BufRead}, net::{SocketAddr, SocketAddrV4}, str::FromStr};
 use anyhow::{Result, anyhow};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use ip_network::Ipv4Network;
+use ipnet::Ipv4Net;
 
 #[derive(Debug, Clone, Copy)]
 pub struct InterfaceConfig {
-    pub addr: Ipv4Addr,
+    pub addr: Ipv4Net,
     pub listen_port: u16,
     pub priv_key: [u8; 32],
 }
@@ -43,7 +44,7 @@ fn parse_key(value: &str) -> Result<[u8;32]> {
 }
 
 fn parse_interface(bufreader: &mut impl BufRead, buf: &mut String) -> Result<(InterfaceConfig, bool)> {
-    let mut addr: Option<Ipv4Addr> = None;
+    let mut addr: Option<Ipv4Net> = None;
     let mut listen_port: Option<u16> = None;
     let mut priv_key: Option<[u8; 32]> = None;
     let mut reparse_line = false;
@@ -72,7 +73,7 @@ fn parse_interface(bufreader: &mut impl BufRead, buf: &mut String) -> Result<(In
                 if addr.is_some() {
                     return Err(anyhow!("parse error (interface): duplicate interface address"))
                 }
-                addr = Some(Ipv4Addr::from_str(value)?);
+                addr = Some(Ipv4Net::from_str(value)?);
             },
             "ListenPort" => {
                 if listen_port.is_some() {
@@ -246,12 +247,12 @@ mod tests {
 
 # comment
 [Interface]
-Address = 10.0.0.1
+Address = 10.0.0.1/24
 ListenPort = 51820
 PrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
 ").unwrap();
         let interface = cfg.interface;
-        assert!(interface.addr.eq(&Ipv4Addr::new(10, 0, 0, 1)));
+        assert!(interface.addr.eq(&Ipv4Net::from_str("10.0.0.1/24").unwrap()));
         assert!(interface.listen_port.eq(&51820));
         assert!(interface.priv_key.eq(&parse_key("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=").unwrap()));
     }
@@ -259,14 +260,14 @@ PrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
     #[test]
     fn ignores_unknown_options() {
         let cfg = parse("[Interface]
-Address = 10.0.0.1
+Address = 10.0.0.1/24
 ListenPort = 51820
 PrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
 UnknownField1 = asdf
 UnknownField2 = UnknownValue2
 ").unwrap();
         let interface = cfg.interface;
-        assert!(interface.addr.eq(&Ipv4Addr::new(10, 0, 0, 1)));
+        assert!(interface.addr.eq(&Ipv4Net::from_str("10.0.0.1/24").unwrap()));
         assert!(interface.listen_port.eq(&51820));
         assert!(interface.priv_key.eq(&parse_key("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=").unwrap()));
     }
@@ -277,7 +278,7 @@ UnknownField2 = UnknownValue2
 PublicKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
 AllowedIPs = 10.192.124.0/24
 [Interface]
-Address = 10.0.0.1
+Address = 10.0.0.1/24
 ListenPort = 51820
 PrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
 

@@ -31,7 +31,7 @@ async fn main() -> Result<()> {
 
     let dev = DeviceBuilder::new()
         .name("utun7")
-        .ipv4(interface.addr, 24, None)
+        .ipv4(interface.addr.addr(), interface.addr.netmask(), None)
         .mtu(MTU)
         .build_async()
         .unwrap();
