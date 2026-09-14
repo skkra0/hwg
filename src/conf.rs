@@ -34,7 +34,7 @@ fn split_key_value(line: &str) -> Result<(&str, &str)> {
     Ok((key.trim(), value.trim()))
 }
 
-fn parse_key(value: &str) -> Result<[u8;32]> {
+pub fn parse_key(value: &str) -> Result<[u8;32]> {
     let bytes = STANDARD.decode(value)?;
     let key: [u8; 32] = bytes
         .try_into()
