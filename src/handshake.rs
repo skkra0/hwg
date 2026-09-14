@@ -248,12 +248,11 @@ impl Session {
 
                 let remote_index = index;
                 let (local_index, len) = write_handshake_resp(remote_index, &mut hs, out)?;
-                let mut index_table = self.index_table.write().unwrap();
-                index_table.insert(local_index, peer.clone());
+                self.index_table.write().unwrap()
+                    .insert(local_index, peer.clone());
                 let mut s = peer.state.lock().map_err(|e| anyhow!("cannot obtain lock: {e}"))?;
                 *s = SessionState::Up { ts: hs.into_transport_mode()?, remote_index };
-                let mut endpoint = peer.endpoint.write().unwrap();
-                *endpoint = Some(src_endpoint);
+                *peer.endpoint.write().unwrap() = Some(src_endpoint);
                 return Ok((len, Destination::Socket));
             },
             MSG_RESP => {
@@ -263,8 +262,9 @@ impl Session {
 
                 let remote_index = index;
                 let local_index = u32::from_le_bytes(buf[8..12].try_into().unwrap());
-                let index_table = self.index_table.read().unwrap();
-                let peer = index_table.get(&local_index).ok_or_else(|| anyhow!("invalid index"))?;
+                let peer = self.index_table.read().unwrap()
+                    .get(&local_index).cloned()
+                    .ok_or_else(|| anyhow!("invalid index"))?;
                 let mut s = peer.state.lock().map_err(|e| anyhow!("cannot obtain lock: {e}"))?;
                 let SessionState::Initiated { hs} = &mut *s else {
                     return Ok((0, Destination::Null));
@@ -280,11 +280,9 @@ impl Session {
                 };
                 *s = SessionState::Up { ts: hs.into_transport_mode()?, remote_index };
 
-                let cur_endpoint = peer.endpoint.read().unwrap();
-                if *cur_endpoint != Some(src_endpoint) {
-                    let mut endpoint = peer.endpoint.write().unwrap();
-                    *endpoint = Some(src_endpoint);
-                } 
+                if *peer.endpoint.read().unwrap() != Some(src_endpoint) {
+                    *peer.endpoint.write().unwrap() = Some(src_endpoint);
+                }
                 return Ok((0, Destination::Null));
             },
             MSG_TRANSPORT => {
@@ -293,9 +291,10 @@ impl Session {
                 }
                 let (nonce, msg) = buf[8..].split_at(8);
                 let nonce = u64::from_le_bytes(nonce.try_into().unwrap());
-                let index_table = self.index_table.read().unwrap();
                 let local_index = index;
-                let peer = index_table.get(&local_index).ok_or_else(|| anyhow!("invalid index"))?;
+                let peer = self.index_table.read().unwrap()
+                    .get(&local_index).cloned()
+                    .ok_or_else(|| anyhow!("invalid index"))?;
                 let mut s = peer.state.lock().map_err(|_| anyhow!("cannot obtain lock"))?;
                 if let SessionState::Up{ ts, remote_index: _} = &mut *s { 
                     ts.set_receiving_nonce(nonce);
@@ -314,8 +313,7 @@ impl Session {
                         return Err(anyhow!("source ip does not match"));
                     }
 
-                    let cur_endpoint = peer.endpoint.read().unwrap();
-                    if *cur_endpoint != Some(src_endpoint) {
+                    if *peer.endpoint.read().unwrap() != Some(src_endpoint) {
                         let mut endpoint = peer.endpoint.write().unwrap();
                         *endpoint = Some(src_endpoint);
                     } 
